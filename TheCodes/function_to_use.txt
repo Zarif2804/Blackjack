@@ -1,0 +1,73 @@
+logging:
+    add_log_message(current_table, "message");
+
+Player Score Management:
+    update_all_players_after_game(current_table, "winner_name");
+    save_scores_to_file(current_table);
+
+Turn Management:
+    advance_turn();  // Advances to next active player
+
+    // Signal scheduler when turn complete:
+    pthread_cond_signal(&current_table->turn_cond);
+
+Shared Memory Data
+
+Game State:
+    current_table->state                    // LOBBY, PLAYING, ENDED
+    current_table->game_number              // Current game #
+    current_table->pot_amount               // Total pot
+    current_table->current_bet              // Current bet to match
+    current_table->current_turn             // Whose turn (index)
+
+Player (array):
+    current_table->players[i].name
+    current_table->players[i].chips
+    current_table->players[i].current_bet
+    current_table->players[i].is_active     // 1 = active, 0 = folded/disconnected
+    current_table->players[i].hole_cards[2] // Their 2 cards
+    current_table->players[i].client_socket_fd
+    current_table->active_player_count
+
+Community Cards:
+    current_table->community_cards[5]
+    current_table->community_cards_revealed  // How many shown (0-5)
+
+Positions:
+    current_table->dealer_position
+    current_table->small_blind_position
+    current_table->big_blind_position
+
+Mutexes (must use)
+
+    // When accessing game state:
+    pthread_mutex_lock(&current_table->state_mutex);
+
+    // ... access state ...
+    pthread_mutex_unlock(&current_table->state_mutex);
+
+    // When accessing players:
+    pthread_mutex_lock(&current_table->players_mutex);
+    // ... access players ...
+    pthread_mutex_unlock(&current_table->players_mutex);
+
+    // When accessing pot/bets/community cards:
+    pthread_mutex_lock(&current_table->game_mutex);
+    // ... access game data ...
+    pthread_mutex_unlock(&current_table->game_mutex);
+
+    // When accessing turn:
+    pthread_mutex_lock(&current_table->turn_mutex);
+    // ... access turn ...
+    pthread_mutex_unlock(&current_table->turn_mutex);
+
+Condition Variables that you can Signal
+
+    // Wake up scheduler (after move processed):
+    pthread_cond_signal(&current_table->turn_cond);
+
+    // Wake up waiting threads (game state changed):
+    pthread_cond_broadcast(&current_table->state_cond);
+
+    // Wake up game logic from scheduler (timeout):
+    pthread_cond_wait(&current_table->scheduler_cond, &mutex);

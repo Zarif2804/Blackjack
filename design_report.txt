@@ -1,0 +1,201 @@
+# Operating System Assignment - Design Report
+## High-Performance Texas Hold'em Poker Server
+
+### 1. System Overview and Game Description
+The implemented system is a robust, multiplayer Texas Hold'em Poker server designed to operate in a Linux environment. It facilitates real-time interaction between multiple clients (2 to 5 players)[...]
+
+The server enforces standard Texas Hold'em rules, including:
+-   Phase Management: Pre-Flop, Flop, Turn, River, and Showdown.
+-   Betting Structure: Support for Call, Check, Fold, Bet, and Raise actions.
+-   Hand Evaluation: A comprehensive algorithms to rank 5-card poker hands from Royal Flush down to High Card.
+-   Session Logic: Games are grouped into 5-hand sessions, determining a session winner based on accumulated chips.
+
+However, the core focus of this report is the underlying System Architecture, which demonstrates advanced Operating System concepts including Multi-processing, Multi-threading, Inter-Process Commu[...]
+
+---
+
+### 2. Deployment Mode: Connection-Oriented TCP/IP
+
+The system utilizes a Connection-Oriented deployment model over TCP/IP (Transmission Control Protocol / Internet Protocol).
+
+#### 2.1 Why TCP/IP?
+Poker is a state-sensitive game. Unlike a video stream where a lost frame is acceptable (UDP), a lost packet in a poker game could mean a missing "Fold" action or a lost "Bet".
+-   Reliability: TCP guarantees that every byte sent by the client is received by the server in the exact order it was sent. This is crucial for maintaining the integrity of the game state (e.g., [...]
+-   Flow Control: TCP manages the rate of data transmission, preventing the server from being overwhelmed by rapid client actions.
+-   Error Checking: Automatic checksums ensure that data is not corrupted during transmission.
+
+#### 2.2 Socket Implementation Details
+The server implementation uses the BSD Socket API:
+1.  `socket(AF_INET, SOCK_STREAM, 0)`: Creates an endpoint for communication.
+    -   `AF_INET`: Specifies the IPv4 address family.
+    -   `SOCK_STREAM`: Specifies a reliable, two-way, connection-based byte stream (TCP).
+2.  `bind()`: Associates the socket with a specific IP address (`INADDR_ANY` for all available interfaces) and Port (`8080`).
+3.  `listen()`: Marks the socket as a passive socket that will be used to accept incoming connection requests.
+4.  `accept()`: Extracts the first connection request on the queue of pending connections, creating a *new* connected socket for that specific client. This allows the main listener socket to remai[...]
+
+#### 2.3 Socket Options
+We specifically utilize `setsockopt(..., SO_REUSEADDR, ...)` during server startup. This advanced socket option allows the server to bind to a port that is still in the "TIME_WAIT" state from a pr[...]
+
+---
+
+### 3. Hybrid Architecture (Multi-Process & Multi-Threaded)
+
+The server employs a Hybrid Architecture that leverages the strengths of both processes and threads to achieve concurrency, isolation, and efficiency.
+
+#### 3.1 Architecture Diagram
+```plaintext
+                                 [+=================+]
+                                 |   SERVER PROCESS  |
+                                 |      (Parent)     |
+                                 [+========+========+]
+                                           |
+         +---------------------+-----------+-----------+---------------------+
+         |                     |                       |                     |
+ [Main Thread]          [Accept Thread]         [Game Logic Thread]    [Logger/Scheduler Threads]
+ (Init & Signals)      (Connection Mgr)         (Central Brain)         (Helpers)
+                                |
+                                | (fork)
+                                v
+                 +-----------------------------+
+                 |                             |
+       [CHILD PROCESS 1]             [CHILD PROCESS 2]  ... (Up to N)
+       (Player 1 Handler)            (Player 2 Handler)
+```
+
+#### 3.2 Thread Responsibilities (Inside Parent Process)
+The Parent Process acts as the central coordinator, running several specialized threads:
+1.  Signal Handling (Zombie Reaper):
+    -   The main thread sets up a `SIGCHLD` signal handler (`zombie_reaper`).
+    -   When a Child Process (Player) disconnects and exits, it becomes a "Zombie" process, occupying an entry in the system process table.
+    -   The `zombie_reaper` asynchronously catches the signal and calls `waitpid(-1, ...)` to clean up these zombies, preventing resource leaks.
+2.  Accept Thread:
+    -   Continuously blocks on `accept()`.
+    -   Upon a new connection, it calls `fork()` to create a dedicated Child Process.
+    -   This ensures the server remains responsive to new players even while handling others.
+3.  Game Logic Thread:
+    -   The "Brain" of the server. It does not communicate directly with clients.
+    -   It monitors the Shared Memory state.
+    -   It enforces rules (e.g., "Is the pot balanced?", "Who won the hand?").
+    -   It advances the game phase (Phases: Pre-Flop -> Flop -> ...).
+4.  Logger Thread:
+    -   A dedicated worker for I/O operations.
+    -   Reads from a lock-free(ish) log queue and writes to disk (`game.log`).
+    -   Decouples slow disk I/O from critical game logic.
+5.  Scheduler Thread:
+    -   Manages time-sensitive events (Turn Timers).
+    -   Ensures the game does not stall if a player disconnects or goes AFK.
+
+#### 3.3 Process Responsibilities (Child Processes)
+For each connected client, a Child Process is spawned.
+-   Isolation: If a child process crashes (e.g., due to a malformed packet), it does not bring down the entire server. The OS isolates the crash to that single process.
+-   Dedicated Communication: The child process blocks on `read()` for its specific client. This simplifies the logic—we don't need complex non-blocking I/O or `select()` loops for *all* clients [...]
+-   State Updates: When a child receives a command (e.g., "FOLD"), it does not process the game rules. Instead, it parses the command and updates the Shared Memory to signal the Game Logic Thread.
+
+---
+
+### 4. IPC Mechanism and Shared Memory Layout
+
+Since the system uses multiple processes (Parent and Children) which exist in separate virtual address spaces, they cannot simply share global variables. We implement Inter-Process Communication ([...]
+
+#### 4.1 Shared Memory Setup
+We use the content of the `shm_open` and `mmap` system calls to create a unified memory region accessible by all processes.
+1.  `shm_open("/poker_shm", ...)`: Creates a POSIX shared memory object named `/poker_shm`.
+2.  `ftruncate(fd, sizeof(PokerTable))`: Sets the size of the shared memory object to exactly fit our `PokerTable` structure.
+3.  `mmap(..., MAP_SHARED, ...)`: Maps this shared memory object into the address space of the process.
+    -   Critical: The `MAP_SHARED` flag ensures that updates to this memory are visible to all other processes mapping the same object.
+
+#### 4.2 The `PokerTable` Structure (The "Whiteboard")
+This structure is the single source of truth for the game.
+```c
+typedef struct {
+    // -- Synchronization Primitives --
+    pthread_mutex_t state_mutex;
+    pthread_cond_t state_cond;
+    // ... other mutexes ...
+
+    // -- Game State --
+    int state;               // LOBBY, PLAYING, ENDED
+    int current_turn;        // Index of player (0-4)
+    int pot_amount;          // Total chips in pot
+    int community_cards[5];  // Shared cards
+
+    // -- Player Data --
+    struct Player {
+        char name[50];
+        int chips;
+        int hole_cards[2];
+        char pending_action[20]; // e.g., "BET"
+        int action_ready;        // Flag: 1 if action is waiting
+    } players[MAX_PLAYERS];
+
+    // -- Queues --
+    LogQueue log_queue;      // Circular buffer for logger
+} PokerTable;
+```
+
+#### 4.3 Data Flow via Shared Memory
+1.  Client Action: Client sends "BET:100".
+2.  Child Process:
+    -   Reads "BET:100".
+    -   Locks `game_mutex`.
+    -   Updates `players[id].pending_action = "BET"`.
+    -   Updates `players[id].pending_action_amount = 100`.
+    -   Sets `players[id].action_ready = 1`.
+    -   Unlocks `game_mutex`.
+3.  Game Logic Thread:
+    -   Scans `players[id].action_ready`.
+    -   Sees the flag is `1`.
+    -   Validates the move (e.g., does player have enough chips?).
+    -   Updates `pot_amount` and `state`.
+    -   Clears `action_ready`.
+
+This design completely decouples the *handling* of network packets (Child Process) from the *execution* of game rules (Parent/Game Logic Thread), linked only by the high-speed shared memory bridg[...]
+
+---
+
+### 5. Synchronization Strategy
+
+In a concurrent system with multiple processes and threads accessing shared resources (the `PokerTable`), Race Conditions are a critical threat. If two players try to bet at the exact same moment[...]
+
+To prevent this, we employ a strict Synchronization Strategy using POSIX Synchronization Primitives initialized with the `PTHREAD_PROCESS_SHARED` attribute. This attribute allows mutexes and cond[...]
+
+#### 5.1 Mutex Design (Locking Hierarchy)
+We use fine-grained locking to minimize contention and maximize parallel performance.
+
+1.  `state_mutex` (High Priority)
+    -   Scope: Protects the global Game State (`state` variable: LOBBY, PLAYING, ENDED).
+    -   Usage: Locked whenever the game transitions between phases (e.g., LOBBY -> PLAYING) or when checking if the game has started.
+    -   Rationale: Ensures that no player can join a game that is in the middle of transitioning states.
+
+2.  `players_mutex` (Medium Priority)
+    -   Scope: Protects the `players[]` array (connecting/disconnecting, updating chip counts).
+    -   Usage: The Accept Thread locks this to add a new player. The Game Logic locks this to check who is still active.
+    -   Rationale: Prevents iterating over the player list while a new player is being added (which could cause a segmentation fault or invalid read).
+
+3.  `game_mutex` (Action Priority)
+    -   Scope: Protects the dynamic game data: `pot_amount`, `current_bet`, `community_cards`, and individual player `pending_action`.
+    -   Usage:
+        -   Child Process: Locks this to write "Player X Folds".
+        -   Game Logic: Locks this to read the action, deduct chips from the player, and add them to the pot.
+    -   Rationale: This is the most frequently used mutex. It ensures atomic updates to the game state—you cannot have chips leave a player's stack without entering the pot in the same atomic t[...]
+
+4.  `turn_mutex` (Flow Control)
+    -   Scope: Protects the `current_turn` variable.
+    -   Usage: The Scheduler Thread and Game Logic Thread coordinate using this mutex to safely hand off control from one player to the next.
+
+#### 5.2 Deadlock Prevention Strategy
+With 6 different mutexes, "Deadlock" (where Thread A holds Lock 1 waiting for Lock 2, and Thread B holds Lock 2 waiting for Lock 1) is a real risk. We mitigate this by enforcing a strict Lock Ord[...]
+1.  Always acquire `state_mutex` first if needed.
+2.  Acquire `players_mutex` second.
+3.  Acquire `game_mutex` third.
+4.  Acquire `log_mutex` last (for logging errors).
+
+By ensuring all threads request locks in the same direction, circular dependencies are impossible.
+
+#### 5.3 Condition Variables (Event Signaling)
+Threads should not "poll" (busy-wait) for events, as this wastes CPU cycles. Instead, we use Condition Variables to sleep until needed.
+
+1.  `state_cond`:
+    -   Waiters: Child Processes, Game Logic Thread.
+    -   Signaler: Main Thread / Game Logic.
+[...]

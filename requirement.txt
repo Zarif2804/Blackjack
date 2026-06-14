@@ -1,0 +1,20 @@
+B. Design Report (PDF, 10-15 pages)
+Include:
+1. Game description and rules
+2. Deployment mode (IPC or TCP)
+3. Hybrid architecture: diagram showing processes, threads, and data flow
+4. IPC mechanism and shared memory layout
+5. Synchronization strategy: how mutexes/semaphores coordinate threads and
+processes
+6. Logger design: thread structure, queue, safety
+7. RR scheduler: how the thread manages turns across processes
+8. Persistence Strategy: Describe the file format, the loading/saving mechanism for
+scores.txt, and the synchronization used to protect the in-memory score data.
+9. Multi-Game Handling: Explain how the server resets and re-initializes for the
+start of a new game.
+
+C. README.txt
+• How to compile (make) and run
+• Example commands
+• Game rules summary
+• Mode supported

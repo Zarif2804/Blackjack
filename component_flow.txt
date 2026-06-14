@@ -1,0 +1,224 @@
+# System Component Flow Analysis
+This document details the step-by-step execution flow of each major component in the Texas Hold'em Poker Server.
+
+## 1. Server Initialization & Infrastructure Setup
+This phase occurs immediately when `./server` is executed. It establishes the groundwork before any player can connect.
+
+### 1.1 Shared Memory Creation
+Goal: Create a memory region accessible by future child processes.
+1.  `main()` Execution: The program starts.
+2.  `shm_open("/poker_shm", ...)`:
+    -   Requests a named shared memory object from the OS.
+    -   Flags: `O_CREAT` (create if missing), `O_RDWR` (read/write), `0666` (permissions).
+3.  `ftruncate(fd, sizeof(PokerTable))`:
+    -   Resizes the memory object to exactly fit the `PokerTable` struct (approx. few KB).
+4.  `mmap(..., MAP_SHARED, ...)`:
+    -   Maps this object into the server's virtual address space.
+    -   Returns a pointer `current_table` which acts as the "Global State".
+5.  Initialization:
+    -   `state` set to `LOBBY`.
+    -   `game_number` set to `0`.
+    -   `players` array cleared.
+    -   Mutexes/Cond Vars initialized with `PTHREAD_PROCESS_SHARED` attribute (Crucial for IPC).
+
+### 1.2 Socket instantiation
+Goal: Create the network door for clients.
+1.  `socket()`: Creates a TCP/IPv4 socket handle.
+2.  `setsockopt(SO_REUSEADDR)`:
+    -   Configures the socket to allow immediate restart even if the port is in `TIME_WAIT`.
+3.  `bind(8080)`:
+    -   Tells the OS: "Any traffic on port 8080 belongs to this process."
+4.  `listen(5)`:
+    -   Tells the OS: "Start queuing incoming connection requests (backlog of 5)."
+
+### 1.3 Thread Spawning
+Goal: Launch the concurrent workers.
+The `main()` function does *not* enter the game loop itself. Instead, it spawns dedicated threads:
+1.  `pthread_create(&accept_thread)`: Starts connection manager.
+2.  `pthread_create(&logger_thread)`: Starts disk I/O manager.
+3.  `pthread_create(&scheduler_thread)`: Starts turn timer manager.
+4.  `pthread_create(&game_logic_thread)`: Starts the rule engine.
+
+### 1.4 Signal Handling Setup
+1.  `signal(SIGINT, proper_shutdown)`:
+    -   Registers the `proper_shutdown` function to handle `Ctrl+C`.
+    -   Ensures shared memory is unlinked (`shm_unlink`) and files closed on exit.
+2.  `signal(SIGCHLD, zombie_reaper)`:
+    -   Registers `zombie_reaper` to handle child process death.
+    -   Prevents "zombie" processes from clogging the system table.
+
+Outcome: The server is now "Active". It is essentially sleeping (blocking) in various threads, waiting for external events (Network Connections).
+
+## 2. Connection Handling Flow (The Gatekeeper)
+This phase describes how a new player connects and how the server assigns resources to them.
+
+### 2.1 The Accept Loop
+Component: `accept_thread_function` (server.c)
+Goal: Wait for phone calls.
+1.  `while(1)`: Infinite loop.
+2.  `accept(server_fd, ...)`:
+    -   BLOCKS here until a client connects.
+    -   Returns a new file descriptor: `new_socket`.
+    -   Also fills `address` struct with client IP/Port.
+
+### 2.2 The Fork (Process Creation)
+Component: `accept_thread_function` -> `fork()`
+Goal: Create a dedicated worker.
+1.  `pid = fork()`:
+    -   Clones the entire server process.
+    -   Returns `0` to the Child Process (The new Player Handler).
+    -   Returns `child_pid > 0` to the Parent Process (The Master Server).
+
+### 2.3 Parent Path (Server Loop)
+1.  `close(new_socket)`:
+    -   The Parent *immediately close* its copy of the new socket.
+    -   Why? The Parent never talks to the client. It only spawns the worker. Keeping it open would waste file descriptors.
+2.  Loop Back:
+    -   Immediately goes back to `accept()` to wait for the *next* player.
+    -   Concurrency: This is why the server can handle multiple clients. It spends almost zero time processing a connection—it just forks and loops.
+
+### 2.4 Child Path (Specific Player Worker)
+1.  `close(server_fd)`:
+    -   The Child closes the listening socket.
+    -   Safety: A child should never accidentally `accept()` a new connection.
+2.  `handle_player(new_socket)`:
+    -   Enters the main `handle_player` logic in `PokerStructure.c`.
+    -   Ownership: This process now "owns" the socket and the player identity.
+    -   Registration:
+        -   Locks `players_mutex`.
+        -   Finds empty slot in `players[]` (Shared Memory).
+        -   Writes Name, IP, resets Chips to 1000.
+        -   Unlocks `players_mutex`.
+    -   State Check:
+        -   If `state == PLAYING`, puts player in "Spectator Queue".
+        -   If `state == LOBBY`, signals `state_cond` to poke the Game Logic thread.
+
+Outcome: A new, independent OS process is created solely for this player. It has a dedicated TCP connection to the client and full access to the Shared Memory "Whiteboard".
+
+## 3. Game Logic Loop (The Brain)
+The `game_logic_thread` runs independently in the Parent Process. It monitors and updates the Shared Memory state.
+
+### 3.1 The Lobby Phase
+1.  Wait Condition:
+    -   Loops while `active_players < 2`.
+    -   Sleeps on `state_cond` to avoid busy-waiting.
+2.  Start Signal:
+    -   When `active_players >= 2` AND Admin types `start`.
+    -   Sets `state = PLAYING`.
+    -   Broadcasts `Game Started!` to all children via Shared Memory update (Children read `state` change).
+
+### 3.2 Hand Initialization
+1.  Reset: Checks `game_number`. If 0 (New Session), resets all player chips to 1000.
+2.  Deck: Shuffles a fresh 52-card deck.
+3.  Deal:
+    -   Assigns 2 Hole Cards to `players[i].hole_cards`.
+    -   Security: These cards are in Shared Memory, but Child Processes are programmed to *only* send the specific player's cards to that player.
+4.  Blinds:
+    -   Automatically deducts Small Blind (10) and Big Blind (20) from appropriate players.
+    -   Updates `pot_amount` = 30.
+
+### 3.3 The Betting Cycle (Pre-Flop -> River)
+For each phase (Pre-Flop, Flop, Turn, River):
+1.  Card Reveal:
+    -   If Flop/Turn/River, reveals 3/1/1 community cards in `community_cards[]`.
+2.  Turn Loop:
+    -   Iterates `current_turn` from SB/BB to Dealer.
+    -   Signal Scheduler: Sets `turn_deadline` and signals `turn_cond` to wake up the Scheduler Thread.
+    -   Wait for Action:
+        -   Sleeps on `turn_cond` (Game Logic pauses here).
+        -   Wakes Up When:
+            -   A) Child Process writes `action_ready = 1` and signals.
+            -   B) Scheduler signals "TIMEOUT".
+3.  Process Action:
+    -   Validates the move (e.g., "Do you have enough chips?").
+    -   Updates Pot and Player Chips.
+    -   Broadcasting: The Logger logs the move, which eventually gets sent to all clients.
+4.  Phase End:
+    -   If all players call/fold, move to next phase.
+
+### 3.4 Showdown & Resolution
+1.  Evaluation:
+    -   Uses `eval_5hand` algorithm on all active players.
+    -   Combines 2 Hole Cards + 5 Community Cards = Best 5.
+2.  Winner Determination:
+    -   Finds highest rank score.
+    -   Pot Distribution: Adds `pot_amount` to Winner's `chips`.
+3.  Cleanup:
+    -   Clears `community_cards`.
+    -   Increments `game_number`.
+    -   Clears `community_cards`.
+    -   Increments `game_number`.
+    -   If `game_number == 5`, triggers Session End (Score Persistence).
+
+## 4. Client Interaction Flow (The User Interface)
+The Client program (`client.c`) is a lightweight terminal interface. It does not know the rules of poker. It simply renders what the server tells it and sends user input back.
+
+### 4.1 Connection & Handshake
+1.  `connect()`: Establishes TCP connection to Server IP.
+2.  Name Exchange:
+    -   Prompts user for Name.
+    -   Sends `NAME:Alice`.
+    -   Waits for `WELCOME`.
+
+### 4.2 The Main Loop (`play_game`)
+The client enters an infinite loop waiting for server commands.
+1.  `read(sock, buffer)`: Blocks until data arrives from Server.
+2.  Message Parsing:
+    -   `STATE:...`: Updates local `GameState` struct (cards, chips, pot). Redraws the UI.
+    -   `MSG:...`: Prints a system message (e.g., "Player Bob Folded").
+    -   `YOURTURN`: Triggers the Input Handling routine.
+    -   `WINNER:...`: Displays the hand winner.
+    -   `SESSION_WINNER:...`: Displays the session winner.
+
+### 4.3 Input Handling (When `YOURTURN` is received)
+1.  Prompt: Displays `>>> YOUR TURN <<<` and valid actions (CHECK, CALL, FOLD, RAISE, BET).
+2.  Capture: Uses `fgets()` to read a line from stdin.
+3.  Local Validation: Checks basic syntax (e.g., is "BET:xyz" a number?).
+4.  Send: Writes the command string (e.g., `BET:100`) to the socket.
+5.  Return to Waiting: Immediately loops back to `read()` to await the server's confirmation (or error message).
+
+4.  Send: Writes the command string (e.g., `BET:100`) to the socket.
+5.  Return to Waiting: Immediately loops back to `read()` to await the server's confirmation (or error message).
+
+Key Concept: The Client is "Dumb". It doesn't calculate if a Flush beats a Straight. It just shows the cards it is given.
+
+## 5. Logger & Scheduler Flow (The Backend Helpers)
+These threads ensure the system remains stable and auditable.
+
+### 5.1 The Logger Loop (Asynchronous Writing)
+Component: `logger_thread_function` (server.c)
+Goal: Write to disk without slowing down the game.
+1.  Lock: Gains `log_mutex`.
+2.  Check Empty:
+    -   If `queue.count == 0`, call `pthread_cond_wait(&log_cond)`.
+    -   Sleeps until a Producer (Game Logic/Child) wakes it up.
+3.  Consume:
+    -   Reads string at `read_index`.
+    -   Updates `read_index` and `count--`.
+    -   Signals `log_has_space_cond` (Wake up any blocked producers).
+4.  Unlock: Releases `log_mutex`.
+5.  Write:
+    -   `fprintf(file, "%s", message)`
+    -   `fflush(file)`: Forces OS to write to physical disk immediately.
+
+### 5.2 The Scheduler Loop (Turn Timer)
+Component: `scheduler_thread_function` (server.c)
+Goal: Prevent AFK players from stalling the game.
+1.  Wait for Turn:
+    -   Sleeps on `turn_cond` using `pthread_cond_timedwait()`.
+    -   Timeout: Set to `current_time + 30 seconds`.
+2.  Wake-up Analysis:
+    -   Case A (Signal Received): Player acted in time.
+        -   Result: `0`.
+        -   Action: Loop back and wait for next turn.
+    -   Case B (Timeout): 30 seconds elapsed.
+        -   Result: `ETIMEDOUT`.
+        -   Action:
+            -   Lock `game_mutex`.
+            -   Force Action: CHECK (if free) or FOLD.
+            -   Log "Player Timed Out".
+            -   Unlock `game_mutex`.
+            -   Signal Game Logic to proceed.
+
+---
+End of Flow Analysis

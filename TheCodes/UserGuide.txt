@@ -1,0 +1,38 @@
+1. Server Side Setup
+    a. Find wifi IP : open powershell and type "ipconfig". 
+        look for the IPv4 address under eth0 (192.168.?.?)
+    b. Open Firewall: Ensure port 8080 is allowed in Windows Defender Firewall (Inbound Rule)
+
+2. Running the Server
+    Navigate to your code directory in WSL.
+
+    Compile the server: gcc server.c -o server.
+
+    Run the server: ./server.
+
+    The terminal should display: Server listening...
+
+3. Client-Side Setup (Friend)
+    Ensure the friend is on the same Wi-Fi network.
+
+    Compile the client: gcc client.c -o client.
+
+    Run the client: ./client.
+
+    When prompted for the IP, the friend must enter the Host's Windows IP.
+
+    Once connected, the message connected to the server.. will appear.
+
+ **If you are using wsl, 
+    1. go to wsl setting
+    2. go to networking
+    3. change networking mode to mirrored
+    **if still dont work
+    try disabling HyperV and DNS proxy
+
+
+to allow ping from random device:
+    Disable-NetFirewallRule -DisplayName "File and Printer Sharing (Echo Request - ICMPv4-In)"
+
+to check whether its actually on:
+    Get-NetFirewallRule -DisplayName "File and Printer Sharing (Echo Request - ICMPv4-In)" | Select-Object Name, Enabled, Direction, Action

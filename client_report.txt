@@ -1,0 +1,119 @@
+# Client Code Analysis Report (`client.c`)
+
+This document provides a technical breakdown of the **Client-Side Application**.
+Unlike the Server, which manages complex logic and state, the Client is designed as a **"Thin Client"** (or Dumb Terminal). Its primary responsibilities are:
+1.  **Rendering**: Displaying the game state received from the server.
+2.  **Input**: Capturing user commands and sending them to the server.
+3.  **Connectivity**: Maintaining a TCP connection.
+
+## 1. Architecture & Global State
+
+### 1.1 The "Thin Client" Philosophy
+The client **does not know the rules of poker**.
+-   It does not know if a "Flush" beats a "Straight".
+-   It does not calculate side pots.
+-   It does not enforce whose turn it is (it relies on the server telling it).
+
+This design is secure because a hacked client cannot manipulate the game state (e.g., giving itself aces) since the server holds the "Source of Truth".
+
+### 1.2 Global Data Structure: `GameState`
+The client maintains a local mirror of the relevant game information in a `GameState` struct. This is updated *only* when the server sends a `STATE:` message.
+
+```c
+typedef struct {
+    // -- Financials --
+    int pot;                // Total chips in the pot
+    int current_bet;        // Amount needed to call
+    int my_chips;           // Player's current balance
+    int my_bet;             // Amount player already put in this round
+
+    // -- Cards --
+    int hole_cards[2];      // The 2 cards in hand (e.g., 5, 23)
+    int community_cards[5]; // The 5 cards on the table
+    int community_revealed; // How many are visible (0, 3, 4, or 5)
+
+    // -- Flags --
+    int is_my_turn;         // 1 if server said "YOUR_TURN"
+    int is_in_lobby;        // 1 if waiting for game start
+} GameState;
+```
+This structure allows the client to repaint the entire screen from scratch whenever a UI refresh is needed (`display_game_state`).
+
+## 2. Initialization Phase
+
+### 2.1 Connection (`client_connect`)
+1.  **Socket Creation**: Uses `socket(AF_INET, SOCK_STREAM, 0)`.
+2.  **Server Discovery**: Prompts user for IP address.
+3.  **Connect**: calls `connect()` to establish the TCP handshake.
+
+### 2.2 Application Handshake (`do_handshake`)
+Before the game loop begins, a simple text-based handshake occurs:
+1.  **Server**: Sends "Enter your name: "
+2.  **Client**: Reads string, prompts user with `fgets`.
+3.  **Client**: Sends `NAME:Alice\n`
+4.  **Server**: Sends "Welcome Alice..."
+
+### 2.3 Waiting Room (`wait_for_game_start`)
+-   The client blocks on `read()` waiting for the signal `GAME_STARTED`.
+-   While waiting, it might receive `WAIT_GAME_START`, which triggers a specific "Lobby UI".
+
+## 3. The Main Execution Loop (`game_loop`)
+
+The heart of the client is an infinite loop that multiplexes network events and user input using `select()`.
+
+### 3.1 I/O Multiplexing (`select`)
+The client cannot simply block on `read()` from the socket, because it also needs to listen for User Input (`stdin`) if it's their turn.
+The `select()` system call monitors two file descriptors:
+1.  `sockfd`: The Server Connection.
+2.  `STDIN_FILENO`: The Keyboard (only added to the set if `state->is_my_turn == 1`).
+
+```c
+// Pseudo-code for select logic
+fd_set read_fds;
+FD_ZERO(&read_fds);
+FD_SET(sock, &read_fds);
+if (is_my_turn) FD_SET(stdin, &read_fds);
+
+select(max_fd, &read_fds, ...);
+```
+
+### 3.2 Message Parsing Protocol (`parse_server_messages`)
+The server sends plain-text commands. The client parses them to update the `GameState`.
+
+| Server Command | Client Action |
+| :--- | :--- |
+| `STATE:pot|bet|chips|mybet` | Updates integer values in struct. |
+| `YOUR_CARDS:5,12` | Updates `hole_cards`. Sets `has_cards=1`. |
+| `COMMUNITY:xx,xx,5,10,xx` | Parsing logic handles "XX" as hidden cards (-1). |
+| `YOUR_TURN` | Sets `is_my_turn = 1`, enabling keyboard input. |
+| `NOT_YOUR_TURN` | Sets `is_my_turn = 0`, ignoring keyboard input. |
+| `MSG:Text` | Prints a notification (e.g., "Bob Folded"). |
+| `WINNER:...` | Displays the Hand Winner screen. |
+| `SESSION_WINNER:...` | Displays the final Session Winner screen. |
+
+**Optimization**: The screen is only redrawn (`display_game_state`) if the `GameState` struct has changed (`memcmp` check). This prevents flickering.
+
+## 4. User Interface
+
+### 4.1 Rendering (`display_game_state`)
+The client uses **ANSI Escape Codes** (`\033[2J\033[H`) to clear the terminal and move the cursor to (0,0) before every frame. This creates the illusion of a static GUI even though it is just text[...]
+
+The UI is drawn top-to-down:
+1.  **Header**: "TEXAS HOLD'EM POKER"
+2.  **Stats**: Pot size, Current Bet.
+3.  **My Data**: My Chips, My Cards (converted from ID `0-51` to `AH`, `Ks` using `cards.h`).
+4.  **Table**: Community Cards.
+5.  **Status Bar**: "YOUR TURN" or "Waiting...".
+
+### 4.2 Input Handling (`get_user_action`)
+When `select()` detects input on `stdin`:
+1.  **Read**: `fgets()` captures the line.
+2.  **Validation**: Local sanity checks (e.g., verifying `BET:xyz` has a number).
+    -   *Why validate locally?* To save network traffic and give instant feedback.
+3.  **Send**: Writes the raw command (e.g., `FOLD\n` or `RAISE:500\n`) to the socket.
+
+## 5. Summary
+The Client code is deliberately simple. It acts as a **Projection Layer** for the Server's state. By handling only rendering and input capture, it ensures that:
+-   **Security**: No game logic can be tampered with on the client side.
+-   **Stability**: The client cannot "crash" the game logic, as it is just a viewer.
+-   **Responsiveness**: Local input validation provides a snappy user experience before network transmission.
